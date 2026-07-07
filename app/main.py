@@ -23,18 +23,19 @@ from app.errors.handlers import (
 from app.lifespan import lifespan
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     """Build and return a FastAPI application instance.
 
     A factory function (rather than a module-level ``app``) so that tests can
-    create isolated instances with different settings.
+    create isolated instances with different *settings*.
     """
-    settings = Settings()
+    if settings is None:
+        settings = Settings()
 
     app = FastAPI(
         title="CLIP Image Classifier",
-        description="Zero-shot image classification for materials-science paper figures.",
-        version="0.1.0",
+        description="Image classification for materials-science paper figures.",
+        version="0.2.0",
         lifespan=lifespan,
     )
 

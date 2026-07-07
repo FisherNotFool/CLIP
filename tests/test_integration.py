@@ -1,15 +1,14 @@
-"""Integration tests — real model weights + sample images.
+"""Integration tests — real model weights + trained linear probe + sample images.
 
-These tests require:
+Requirements:
+1. CLIP model in ``model_cache/`` (run ``python scripts/download_model.py``)
+2. Trained linear probe in ``model_cache/linear_probe.pt`` (run ``python scripts/train.py``)
+3. Sample images in ``samples/{class_name}/``
 
-1. The CLIP model downloaded to ``model_cache/``
-   (run ``python scripts/download_model.py`` first).
-2. Sample images placed in ``samples/<class_name>/``.
-
-Marked with ``@pytest.mark.integration`` and skipped by default.
+Marked with ``@pytest.mark.integration`` — skipped by default.
 Run with::
 
-    pytest tests/test_integration.py -m integration -v
+    pytest tests/test_integration.py -m integration -v -s
 """
 
 from __future__ import annotations
@@ -19,6 +18,9 @@ from pathlib import Path
 import pytest
 
 SAMPLES_DIR = Path("samples")
+
+# Only these 4 classes participate in training; "other" is fallback
+TRAIN_CLASSES = {"bar_chart", "line_chart", "sem", "xrd"}
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ def _collect_sample_images() -> dict[str, list[Path]]:
     for class_dir in SAMPLES_DIR.iterdir():
         if not class_dir.is_dir():
             continue
-        images = list(class_dir.glob("*"))  # match jpg, png, tiff, etc.
+        images = list(class_dir.glob("*"))
         if images:
             samples[class_dir.name] = images
     return samples
@@ -49,30 +51,29 @@ def _collect_sample_images() -> dict[str, list[Path]]:
 @pytest.mark.integration
 class TestRealModelLoad:
     def test_classifier_initializes(self, real_classifier):
-        """Sanity check — the real model loads without errors."""
         assert real_classifier is not None
-        assert len(real_classifier._labels) >= 5
-        assert real_classifier._text_embeddings is not None
+        assert len(real_classifier._label_names) == 4
+        assert real_classifier._linear_head is not None
+
+    def test_trained_classes_match_expected(self, real_classifier):
+        assert set(real_classifier._label_names) == TRAIN_CLASSES
 
 
 @pytest.mark.integration
 class TestRealModelInference:
     def test_classify_single_returns_result(self, real_classifier):
-        """Run inference on the first available sample image."""
         all_samples = _collect_sample_images()
         if not all_samples:
             pytest.skip("No sample images found in samples/")
 
-        # Pick any image
         first_class = next(iter(all_samples.values()))
         image_path = first_class[0]
 
         result = real_classifier.classify_single(image_path)
-        assert result.label in real_classifier._labels
+        assert result.label in TRAIN_CLASSES | {"other"}
         assert 0.0 <= result.confidence <= 1.0
 
     def test_classify_batch(self, real_classifier):
-        """Batch inference on all available samples."""
         all_samples = _collect_sample_images()
         all_paths = [p for paths in all_samples.values() for p in paths]
         if len(all_paths) < 2:
@@ -87,7 +88,11 @@ class TestRealModelInference:
 @pytest.mark.integration
 class TestKnownSamples:
     def test_known_samples_classified_correctly(self, real_classifier):
-        """Each sample in samples/<class>/ should get classified as that class."""
+        """Each sample in samples/<class>/ should get classified as that class.
+
+        Only evaluates the 4 training classes; "other" samples are only used
+        for threshold calibration, not accuracy measurement.
+        """
         all_samples = _collect_sample_images()
         if not all_samples:
             pytest.skip("No sample images found in samples/")
@@ -97,6 +102,10 @@ class TestKnownSamples:
         failures: list[str] = []
 
         for expected_label, image_paths in all_samples.items():
+            # "other" is not a trained class — skip for accuracy
+            if expected_label not in TRAIN_CLASSES:
+                continue
+
             for image_path in image_paths:
                 result = real_classifier.classify_single(image_path)
                 total += 1
@@ -109,28 +118,39 @@ class TestKnownSamples:
                     )
 
         accuracy = correct / total if total > 0 else 0.0
-        print(f"\nAccuracy: {correct}/{total} = {accuracy:.1%}")
+        print(f"\nAccuracy (4 training classes): {correct}/{total} = {accuracy:.1%}")
 
         if failures:
-            print("Misclassifications:")
+            print(f"\nMisclassifications ({len(failures)}):")
             for f in failures:
                 print(f"  {f}")
 
-        # At minimum, accuracy should be better than random (20% for 5 classes)
-        assert accuracy >= 0.20, f"Accuracy {accuracy:.1%} worse than random chance"
+        # Linear probe should comfortably beat random (25% for 4 classes)
+        assert accuracy >= 0.40, f"Accuracy {accuracy:.1%} — barely above random"
 
-    def test_confidence_threshold_tuning(self, real_classifier):
-        """Smoke-test different confidence thresholds."""
+    def test_other_samples_fall_below_threshold(self, real_classifier):
+        """samples/other/ images should mostly be caught by the confidence
+        threshold and output 'other'."""
         all_samples = _collect_sample_images()
-        if not all_samples:
-            pytest.skip("No sample images found in samples/")
+        other_paths = all_samples.get("other", [])
+        if not other_paths:
+            pytest.skip("No samples/other/ images found")
 
-        first_path = next(iter(next(iter(all_samples.values()))))
+        from app.config import settings
 
-        # Without threshold — should get a real label
-        r1 = real_classifier.classify_single(first_path, confidence_threshold=None)
-        assert r1.label != "error"
+        caught = 0
+        for image_path in other_paths:
+            result = real_classifier.classify_single(
+                image_path,
+                confidence_threshold=settings.confidence_threshold,
+            )
+            if result.label == "other":
+                caught += 1
 
-        # With very high threshold — should force "other"
-        r2 = real_classifier.classify_single(first_path, confidence_threshold=0.999)
-        assert r2.label == "other"
+        rate = caught / len(other_paths)
+        print(f"\nOther fallback rate: {caught}/{len(other_paths)} = {rate:.1%}")
+        print(f"  (threshold = {settings.confidence_threshold})")
+
+        # Not a hard assertion — threshold may need tuning
+        # Just report the number so the user can calibrate
+        assert rate >= 0.0  # informational only

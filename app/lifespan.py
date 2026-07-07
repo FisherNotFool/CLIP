@@ -30,6 +30,8 @@ async def lifespan(app: FastAPI):
         device=settings.device,
         offline=settings.transformers_offline,
         max_image_size=settings.max_image_size,
+        linear_probe_path=settings.linear_probe_path,
+        label_map_path=settings.label_map_path,
     )
 
     logger.info("CLIP classifier loaded — ready to serve.")

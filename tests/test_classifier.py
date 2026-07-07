@@ -8,7 +8,7 @@ from app.services.classifier import ClipClassifier, ClassificationResult
 
 
 # ---------------------------------------------------------------------------
-# Classifier fixture (uses mocked CLIP model from conftest)
+# Fixtures
 # ---------------------------------------------------------------------------
 
 
@@ -18,6 +18,8 @@ def classifier(mock_clip_model) -> ClipClassifier:
         model_name="openai/clip-vit-base-patch32",
         device="cpu",
         offline=True,
+        linear_probe_path=mock_clip_model["probe_path"],
+        label_map_path=mock_clip_model["label_map_path"],
     )
 
 
@@ -27,28 +29,35 @@ def classifier(mock_clip_model) -> ClipClassifier:
 
 
 class TestInitialization:
-    def test_precomputes_text_embeddings(self, classifier):
-        assert classifier._text_embeddings is not None
-        assert classifier._text_embeddings.shape[0] == 5  # 5 classes
-        assert len(classifier._labels) == 5
-        assert "bar_chart" in classifier._labels
+    def test_linear_head_loaded(self, classifier):
+        assert classifier._linear_head is not None
+        assert classifier._linear_head.out_features == 4
+        assert classifier._linear_head.in_features == 512
+
+    def test_label_names_are_4_training_classes(self, classifier):
+        assert classifier._label_names == ["bar_chart", "line_chart", "sem", "xrd"]
+        assert len(classifier._label_names) == 4
 
     def test_labels_match_config(self, classifier):
         from app.config import settings
 
-        assert set(classifier._labels) == set(settings.class_labels.keys())
+        trained = set(classifier._label_names)
+        config_labels = set(settings.class_labels.keys())
+        # "other" is in config but not in trained labels
+        assert trained.issubset(config_labels)
+        assert "other" not in trained
 
 
 class TestClassifySingle:
     def test_returns_classification_result(self, classifier, sample_image_rgb):
         result = classifier.classify_single(sample_image_rgb)
         assert isinstance(result, ClassificationResult)
-        assert result.label in classifier._labels
+        assert result.label in {"bar_chart", "line_chart", "sem", "xrd", "other"}
         assert 0.0 <= result.confidence <= 1.0
 
-    def test_all_scores_cover_all_classes(self, classifier, sample_image_rgb):
+    def test_all_scores_cover_trained_classes(self, classifier, sample_image_rgb):
         result = classifier.classify_single(sample_image_rgb)
-        assert set(result.all_scores.keys()) == set(classifier._labels)
+        assert set(result.all_scores.keys()) == set(classifier._label_names)
 
     def test_all_scores_sum_to_one(self, classifier, sample_image_rgb):
         result = classifier.classify_single(sample_image_rgb)
@@ -66,15 +75,14 @@ class TestClassifySingle:
 
     def test_grayscale_image_converted(self, classifier, sample_image_gray):
         result = classifier.classify_single(sample_image_gray)
-        assert result.label in classifier._labels
-        assert 0.0 <= result.confidence <= 1.0
+        assert result.label in {"bar_chart", "line_chart", "sem", "xrd", "other"}
 
     def test_rgba_image_converted(self, classifier, sample_image_rgba):
         result = classifier.classify_single(sample_image_rgba)
-        assert result.label in classifier._labels
+        assert result.label in {"bar_chart", "line_chart", "sem", "xrd", "other"}
 
-    def test_confidence_threshold_forces_other(self, classifier, sample_image_rgb):
-        """With threshold=0.99, even the best prediction should become 'other'."""
+    def test_threshold_forces_other(self, classifier, sample_image_rgb):
+        """With threshold=0.99 the best label should be forced to 'other'."""
         result = classifier.classify_single(sample_image_rgb, confidence_threshold=0.99)
         assert result.label == "other"
 
@@ -96,17 +104,15 @@ class TestClassifyBatch:
     def test_each_result_has_valid_label(self, classifier, three_images):
         results = classifier.classify_batch(three_images)
         for r in results:
-            assert r.label in classifier._labels or r.label == "error"
+            assert r.label in {"bar_chart", "line_chart", "sem", "xrd", "other", "error"}
 
     def test_mixed_valid_and_missing(self, classifier, sample_image_rgb, tmp_path):
         nonexistent = tmp_path / "ghost.jpg"
         paths = [sample_image_rgb, nonexistent, sample_image_rgb]
         results = classifier.classify_batch(paths)
         assert len(results) == 3
-        # The missing one should be "error"
         assert results[1].label == "error"
         assert results[1].confidence == 0.0
-        # Valid ones should be classified
         assert results[0].label != "error"
         assert results[2].label != "error"
 
@@ -117,7 +123,7 @@ class TestClassificationResult:
             image_path="test.jpg",
             label="sem",
             confidence=0.95,
-            all_scores={"bar_chart": 0.01, "sem": 0.95, "other": 0.04},
+            all_scores={"bar_chart": 0.01, "line_chart": 0.01, "sem": 0.95, "xrd": 0.03},
         )
         assert r.image_path == "test.jpg"
         assert r.label == "sem"

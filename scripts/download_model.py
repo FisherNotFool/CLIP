@@ -6,9 +6,20 @@ can be transferred to the air-gapped deployment target.
 
 Usage::
 
+    # Default (direct to HuggingFace Hub)
     python scripts/download_model.py
+
+    # Via mirror (for users in China / behind firewalls)
+    python scripts/download_model.py --mirror
+    python scripts/download_model.py --endpoint https://hf-mirror.com
+
+    # Custom model or cache location
     python scripts/download_model.py --model openai/clip-vit-base-patch32
     python scripts/download_model.py --cache-dir /opt/models/clip
+
+Environment variables::
+
+    HF_ENDPOINT — set to a mirror URL before running (equivalent to --endpoint)
 """
 
 from __future__ import annotations
@@ -17,6 +28,29 @@ import argparse
 import os
 import sys
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Must set HF_ENDPOINT BEFORE importing anything from huggingface_hub
+# ---------------------------------------------------------------------------
+
+_MIRROR_URL = "https://hf-mirror.com"
+
+
+def _parse_endpoint() -> str | None:
+    """Peek at CLI args to detect --mirror / --endpoint *before* imports."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--mirror":
+            return _MIRROR_URL
+        if arg == "--endpoint" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("--endpoint="):
+            return arg.split("=", 1)[1]
+    return os.environ.get("HF_ENDPOINT")
+
+
+_endpoint = _parse_endpoint()
+if _endpoint:
+    os.environ["HF_ENDPOINT"] = _endpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +67,16 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("MODEL_CACHE_DIR", "./model_cache"),
         help="Local directory to store cached model files (default: ./model_cache)",
     )
+    parser.add_argument(
+        "--mirror",
+        action="store_true",
+        help=f"Use HF mirror ({_MIRROR_URL}) — for users behind firewalls",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default=os.environ.get("HF_ENDPOINT"),
+        help=f"Custom HuggingFace Hub endpoint URL (env: HF_ENDPOINT)",
+    )
     return parser.parse_args()
 
 
@@ -43,6 +87,8 @@ def main() -> None:
 
     print(f"Model:     {model_name}")
     print(f"Cache dir: {cache_dir}")
+    if os.environ.get("HF_ENDPOINT"):
+        print(f"Mirror:    {os.environ['HF_ENDPOINT']}")
     print()
 
     # 1. Download full repository snapshot via huggingface_hub
