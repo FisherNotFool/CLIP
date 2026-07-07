@@ -1,0 +1,11 @@
+[project]
+name = "clip-classifier"
+version = "0.1.0"
+description = "Zero-shot CLIP image classifier for materials-science paper figures"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require a real CLIP model and sample images",
+]

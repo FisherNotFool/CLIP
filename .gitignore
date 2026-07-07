@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+.venv/
+venv/
+
+# Model cache (large binary files — use download_model.py to populate)
+model_cache/
+
+# Environment (may contain local paths)
+.env
+# But keep the example:
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Sample images (user data)
+# Uncomment if samples shouldn't be committed:
+# samples/
