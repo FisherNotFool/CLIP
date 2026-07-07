@@ -1,8 +1,12 @@
 """CLIP image classifier with a trained linear probe head.
 
 The CLIP vision encoder is frozen; a single ``nn.Linear(512, 4)`` layer
-(trained via ``scripts/train.py``) sits on top.  Images that don't confidently
-match any of the 4 training classes fall back to ``"other"``.
+(trained via ``scripts/train.py``) sits on top.  Images that lie too far
+from all class centroids in cosine-distance space fall back to ``"other"``.
+
+The "is it any known class?" (centroid distance) and "which class is it?"
+(linear probe) decisions are independent — centroids handle outlier
+detection; the probe handles fine-grained classification.
 
 Pure Python — zero HTTP dependencies.  Can be used from scripts, notebooks, or
 the FastAPI application equally.
@@ -17,6 +21,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
@@ -84,6 +89,9 @@ class ClipClassifier:
         Path to the trained ``LinearProbe`` state dict.
     label_map_path:
         Path to a JSON file with ``{"label_names": [...]}``.
+    centroids_path:
+        Path to ``model_cache/centroids.pt`` — class centroids for outlier
+        detection (cosine-distance based "other" fallback).
     """
 
     def __init__(
@@ -95,6 +103,7 @@ class ClipClassifier:
         max_image_size: int = 1920,
         linear_probe_path: str | Path | None = None,
         label_map_path: str | Path | None = None,
+        centroids_path: str | Path | None = None,
     ) -> None:
         self.model_name = model_name
         self.device = device
@@ -152,8 +161,34 @@ class ClipClassifier:
         self._linear_head.to(device)
         self._linear_head.eval()
 
+        # ------------------------------------------------------------------
+        # Load class centroids (outlier / "other" detection)
+        # ------------------------------------------------------------------
+        c_path = Path(
+            centroids_path
+            or Path(cache_dir or "model_cache") / "centroids.pt"
+        )
+
+        if not c_path.exists():
+            raise FileNotFoundError(
+                f"Centroids file not found: {c_path}\n"
+                f"Run: python scripts/train.py"
+            )
+
+        centroids_data = torch.load(c_path, map_location=device, weights_only=True)
+        self._centroids = centroids_data["centroids"].to(device)  # [C, 512]
+        # Ensure centroids are L2-normalised (they should be from train.py, but be safe)
+        self._centroids = F.normalize(self._centroids, p=2, dim=1)
+        # Verify label order matches the probe
+        centroids_labels = centroids_data["label_names"]
+        if centroids_labels != self._label_names:
+            logger.warning(
+                "Centroid label order %s differs from probe %s — results may be wrong!",
+                centroids_labels, self._label_names,
+            )
+
         logger.info(
-            "CLIP classifier ready — %d classes (linear probe): %s",
+            "CLIP classifier ready — %d classes (linear probe + centroids): %s",
             num_classes,
             ", ".join(self._label_names),
         )
@@ -166,14 +201,14 @@ class ClipClassifier:
         self,
         image_path: str | Path,
         *,
-        confidence_threshold: float | None = None,
+        distance_threshold: float | None = None,
     ) -> ClassificationResult:
         """Classify a single image on disk.
 
         Returns a ``ClassificationResult`` with the top-1 label and softmax
-        scores across all training classes.  When *confidence_threshold* is
-        set and the best score falls below it the label is forced to
-        ``"other"``.
+        scores across all training classes.  When *distance_threshold* is
+        set and the image's minimum cosine distance to any class centroid
+        exceeds it, the label is forced to ``"other"``.
         """
         path = Path(image_path)
         if not path.exists():
@@ -187,7 +222,7 @@ class ClipClassifier:
         if max(image.size) > self.max_image_size:
             image.thumbnail((self.max_image_size, self.max_image_size), Image.LANCZOS)
 
-        return self._classify_image(image, str(image_path), confidence_threshold)
+        return self._classify_image(image, str(image_path), distance_threshold)
 
     # ------------------------------------------------------------------
     # Batch classification
@@ -197,7 +232,7 @@ class ClipClassifier:
         self,
         image_paths: list[str | Path],
         *,
-        confidence_threshold: float | None = None,
+        distance_threshold: float | None = None,
     ) -> list[ClassificationResult]:
         """Classify multiple images, processing in sub-batches.
 
@@ -247,7 +282,7 @@ class ClipClassifier:
                 batch_results = self._classify_images(
                     images,
                     [str(image_paths[idx]) for idx in pending],
-                    confidence_threshold,
+                    distance_threshold,
                 )
                 for idx, cr in zip(pending, batch_results):
                     chunk_map[idx] = cr
@@ -269,19 +304,31 @@ class ClipClassifier:
         self,
         images: list[Image.Image],
         paths: list[str],
-        confidence_threshold: float | None,
+        distance_threshold: float | None,
     ) -> list[ClassificationResult]:
-        """Run a single forward pass for a batch of images."""
-        # Encode images with frozen CLIP
+        """Run a single forward pass for a batch of images.
+
+        1. Encode with frozen CLIP → 512-dim features
+        2. L2-normalise features and compute cosine distance to each centroid
+        3. If min distance > *distance_threshold* → ``"other"``
+        4. Otherwise → linear probe softmax → best class
+        """
+        # Step 1 — CLIP encode
         inputs = self.processor(images=images, return_tensors="pt", padding=True)
         pixel_values = inputs["pixel_values"].to(self.device)
 
         image_features = self.model.get_image_features(pixel_values=pixel_values)
         image_features = _to_tensor(image_features)              # [B, 512]
 
-        # Pass through trained linear head
-        logits = self._linear_head(image_features)               # [B, C]
-        probs = logits.softmax(dim=-1)                           # [B, C]
+        # Step 2 — cosine distance to centroids
+        features_norm = F.normalize(image_features, p=2, dim=1)  # [B, 512]
+        cos_sim = features_norm @ self._centroids.T               # [B, C]
+        cos_dist = 1.0 - cos_sim                                  # [B, C]
+        min_dist, nearest_centroid = cos_dist.min(dim=1)          # [B], [B]
+
+        # Step 3 — linear probe classification (for images that pass the centroid check)
+        logits = self._linear_head(image_features)                # [B, C]
+        probs = logits.softmax(dim=-1)                            # [B, C]
 
         results: list[ClassificationResult] = []
         for i, path in enumerate(paths):
@@ -289,13 +336,20 @@ class ClipClassifier:
             for j, label in enumerate(self._label_names):
                 scores[label] = round(probs[i, j].item(), 4)
 
+            # --- Centroid-distance check ---
+            if distance_threshold is not None and min_dist[i].item() > distance_threshold:
+                results.append(ClassificationResult(
+                    image_path=path,
+                    label="other",
+                    confidence=round(1.0 - min_dist[i].item(), 4),
+                    all_scores=scores,
+                ))
+                continue
+
+            # --- Normal classification via linear probe ---
             best_idx = probs[i].argmax().item()
             best_label = self._label_names[best_idx]
             best_conf = probs[i, best_idx].item()
-
-            # Confidence threshold — fall back to "other"
-            if confidence_threshold is not None and best_conf < confidence_threshold:
-                best_label = "other"
 
             results.append(ClassificationResult(
                 image_path=path,
@@ -310,6 +364,6 @@ class ClipClassifier:
         self,
         image: Image.Image,
         path: str,
-        confidence_threshold: float | None,
+        distance_threshold: float | None,
     ) -> ClassificationResult:
-        return self._classify_images([image], [path], confidence_threshold)[0]
+        return self._classify_images([image], [path], distance_threshold)[0]

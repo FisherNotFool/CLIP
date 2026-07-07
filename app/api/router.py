@@ -63,7 +63,7 @@ async def classify_images(
     try:
         results: list[ClassificationResult] = classifier.classify_batch(
             resolved_paths,
-            confidence_threshold=settings.confidence_threshold,
+            distance_threshold=settings.centroid_distance_threshold,
         )
     except Exception as exc:
         raise InferenceError(str(exc)) from exc

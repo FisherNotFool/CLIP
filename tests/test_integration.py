@@ -128,9 +128,71 @@ class TestKnownSamples:
         # Linear probe should comfortably beat random (25% for 4 classes)
         assert accuracy >= 0.40, f"Accuracy {accuracy:.1%} — barely above random"
 
+    def test_accuracy_with_centroid_threshold(self, real_classifier):
+        """Same as above but WITH centroid distance threshold — shows how many
+        real training-class images get falsely rejected as 'other'."""
+        from app.config import settings
+
+        all_samples = _collect_sample_images()
+        if not all_samples:
+            pytest.skip("No sample images found in samples/")
+
+        threshold = settings.centroid_distance_threshold
+        correct = 0
+        total = 0
+        forced_to_other: list[str] = []
+        misclassified: list[str] = []
+
+        for expected_label, image_paths in all_samples.items():
+            if expected_label not in TRAIN_CLASSES:
+                continue
+
+            for image_path in image_paths:
+                result = real_classifier.classify_single(
+                    image_path, distance_threshold=threshold,
+                )
+                total += 1
+
+                if result.label == "other":
+                    # Centroid threshold rejected a real training-class image
+                    forced_to_other.append(
+                        f"{image_path.name}: expected={expected_label}, "
+                        f"forced to other"
+                    )
+                elif result.label == expected_label:
+                    correct += 1
+                else:
+                    misclassified.append(
+                        f"{image_path.name}: expected={expected_label}, "
+                        f"got={result.label} (conf={result.confidence:.3f})"
+                    )
+
+        accuracy = correct / total if total > 0 else 0.0
+        false_positive_rate = len(forced_to_other) / total if total > 0 else 0.0
+
+        print(f"\nAccuracy WITH centroid threshold={threshold}: {correct}/{total} = {accuracy:.1%}")
+        print(f"  Rejected as 'other' (false positives): {len(forced_to_other)}/{total} = {false_positive_rate:.1%}")
+
+        if forced_to_other:
+            print(f"\n  Images wrongly rejected as 'other' ({len(forced_to_other)}):")
+            for f in forced_to_other[:20]:  # cap at 20
+                print(f"    {f}")
+            if len(forced_to_other) > 20:
+                print(f"    ... and {len(forced_to_other) - 20} more")
+
+        if misclassified:
+            print(f"\n  Still misclassified (not forced to other) ({len(misclassified)}):")
+            for m in misclassified[:10]:
+                print(f"    {m}")
+            if len(misclassified) > 10:
+                print(f"    ... and {len(misclassified) - 10} more")
+
+        # This is informational — no hard assertion
+        assert accuracy >= 0.0
+
     def test_other_samples_fall_below_threshold(self, real_classifier):
-        """samples/other/ images should mostly be caught by the confidence
-        threshold and output 'other'."""
+        """samples/other/ images should mostly be caught by the centroid
+        distance threshold and output 'other'."""
         all_samples = _collect_sample_images()
         other_paths = all_samples.get("other", [])
         if not other_paths:
@@ -142,14 +204,14 @@ class TestKnownSamples:
         for image_path in other_paths:
             result = real_classifier.classify_single(
                 image_path,
-                confidence_threshold=settings.confidence_threshold,
+                distance_threshold=settings.centroid_distance_threshold,
             )
             if result.label == "other":
                 caught += 1
 
         rate = caught / len(other_paths)
-        print(f"\nOther fallback rate: {caught}/{len(other_paths)} = {rate:.1%}")
-        print(f"  (threshold = {settings.confidence_threshold})")
+        print(f"\nOther fallback rate (centroid distance): {caught}/{len(other_paths)} = {rate:.1%}")
+        print(f"  (centroid_distance_threshold = {settings.centroid_distance_threshold})")
 
         # Not a hard assertion — threshold may need tuning
         # Just report the number so the user can calibrate

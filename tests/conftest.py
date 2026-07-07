@@ -145,6 +145,16 @@ def mock_clip_model(mocker, tmp_path):
         json.dumps({"label_names": ["bar_chart", "line_chart", "sem", "xrd"]})
     )
 
+    # --- Mock centroids (unit vectors along each class dimension) ---
+    centroids_path = tmp_path / "centroids.pt"
+    centroids_tensor = torch.zeros(4, 512)
+    for c in range(4):
+        centroids_tensor[c, c] = 1.0  # already L2-normalised
+    torch.save(
+        {"centroids": centroids_tensor, "label_names": ["bar_chart", "line_chart", "sem", "xrd"]},
+        centroids_path,
+    )
+
     # --- Mock CLIPModel ---
     mock = MagicMock()
     mock.config = MagicMock()
@@ -164,6 +174,7 @@ def mock_clip_model(mocker, tmp_path):
         "model": mock,
         "probe_path": probe_path,
         "label_map_path": label_map_path,
+        "centroids_path": centroids_path,
     }
 
 
@@ -190,6 +201,7 @@ def test_app(mock_clip_model):
         transformers_offline=True,
         linear_probe_path=mock_clip_model["probe_path"],
         label_map_path=mock_clip_model["label_map_path"],
+        centroids_path=mock_clip_model["centroids_path"],
     )
 
     app = create_app(test_settings)
@@ -201,6 +213,7 @@ def test_app(mock_clip_model):
         offline=True,
         linear_probe_path=str(mock_clip_model["probe_path"]),
         label_map_path=str(mock_clip_model["label_map_path"]),
+        centroids_path=str(mock_clip_model["centroids_path"]),
     )
 
     client = TestClient(app)
@@ -230,4 +243,5 @@ def real_classifier():
         offline=True,
         linear_probe_path=settings.linear_probe_path,
         label_map_path=settings.label_map_path,
+        centroids_path=settings.centroids_path,
     )

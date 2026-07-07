@@ -29,5 +29,4 @@ htmlcov/
 .coverage
 
 # Sample images (user data)
-# Uncomment if samples shouldn't be committed:
-# samples/
+samples/

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     linear_probe_path: Path = Path("./model_cache/linear_probe.pt")
     label_map_path: Path = Path("./model_cache/label_map.json")
 
+    # --- Centroids (outlier detection for "other" fallback) ---
+    centroids_path: Path = Path("./model_cache/centroids.pt")
+    centroid_distance_threshold: float = 0.30  # cosine distance; lower = stricter
+
     # --- Labels — single source of truth for available classes ---
     # "other" is a fallback (not a trained class); the 4 trained classes are
     # determined at training time and persisted in label_map.json.

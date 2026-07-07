@@ -2,8 +2,15 @@
 """Train a linear probe on frozen CLIP ViT features for 4-class classification.
 
 Only trains on bar_chart / line_chart / sem / xrd.  The "other" category is
-handled at inference time via a confidence threshold — images that don't
-confidently match any of the 4 classes fall back to "other".
+handled at inference time via **cosine distance from class centroids**:
+
+1. Compute the 512-dim centroid (mean feature) for each training class.
+2. At inference time, if a new image's minimum cosine distance to *any*
+   centroid exceeds a threshold, it is classified as "other".
+3. Otherwise, the linear probe decides which of the 4 classes it belongs to.
+
+This separates "is it any known class at all?" (centroid distance) from
+"which class is it?" (linear probe).
 
 Usage::
 
@@ -38,6 +45,7 @@ SAMPLES_DIR = Path("samples")
 FEATURES_CACHE = Path("scripts/features.pt")
 DEFAULT_OUTPUT = Path("model_cache/linear_probe.pt")
 DEFAULT_LABEL_MAP = Path("model_cache/label_map.json")
+DEFAULT_CENTROIDS = Path("model_cache/centroids.pt")
 EMBEDDING_DIM = 512
 
 # Only these 4 classes participate in training (other is fallback)
@@ -219,28 +227,83 @@ def train_probe(
 
 
 # ---------------------------------------------------------------------------
-# Other-class evaluation (threshold calibration)
+# Centroids — class-conditional means for outlier detection
+# ---------------------------------------------------------------------------
+
+
+def compute_centroids(
+    features: dict,
+    label_names: list[str],
+    device: str = "cpu",
+) -> dict:
+    """Compute the 512-dim mean feature vector for each training class.
+
+    Uses all extracted features (not just the train split) since centroids
+    are pure averages — no gradient-based learning is involved.
+
+    Returns a dict with L2-normalised centroids ready for cosine-distance checks.
+    """
+    import torch.nn.functional as F
+
+    X = features["X"]
+    y = features["y"]
+
+    centroids = []
+    for class_idx in range(len(label_names)):
+        mask = y == class_idx
+        if mask.sum() == 0:
+            raise ValueError(f"No features found for class '{label_names[class_idx]}'")
+        centroid = X[mask].mean(dim=0)  # [512]
+        # L2-normalise so cosine similarity = dot product
+        centroid = F.normalize(centroid, p=2, dim=0)
+        centroids.append(centroid)
+
+    centroids_tensor = torch.stack(centroids)  # [C, 512]
+
+    logger.info("Computed %d class centroids (L2-normalised):", len(label_names))
+    for i, name in enumerate(label_names):
+        logger.info("  %s: norm=%.4f", name, centroids_tensor[i].norm().item())
+
+    return {"centroids": centroids_tensor, "label_names": label_names}
+
+
+def save_centroids(
+    centroids_data: dict,
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(centroids_data, output_path)
+    logger.info("Saved centroids to %s", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Other-class evaluation (centroid-distance based threshold calibration)
 # ---------------------------------------------------------------------------
 
 
 def evaluate_other(
-    model: LinearProbe,
-    features_cache: dict,
+    centroids_data: dict,
     device: str = "cpu",
 ) -> list[dict]:
-    """Run the 4-class probe against samples/other/ images.
+    """Run centroid-distance check against samples/other/ images.
 
-    Returns per-image probabilities to help calibrate the confidence threshold.
+    Computes cosine distance to the nearest class centroid for every image
+    in samples/other/ and prints a distribution to help pick a
+    ``centroid_distance_threshold``.
     """
+    import torch.nn.functional as F
+    from PIL import Image
+    from transformers import CLIPModel, CLIPProcessor
+
     other_dir = SAMPLES_DIR / "other"
     if not other_dir.is_dir():
         logger.info("No samples/other/ directory — skipping threshold calibration.")
         return []
 
-    # Load the full CLIP model to encode other samples
-    from PIL import Image
-    from transformers import CLIPModel, CLIPProcessor
+    centroids = centroids_data["centroids"].to(device)  # [C, 512], already L2-normalised
+    label_names = centroids_data["label_names"]
 
+    # Load CLIP vision encoder
     clip = (
         CLIPModel.from_pretrained(
             settings.clip_model_name,
@@ -256,7 +319,6 @@ def evaluate_other(
         local_files_only=True,
     )
 
-    model = model.to(device).eval()
     results: list[dict] = []
 
     for img_path in sorted(other_dir.iterdir()):
@@ -268,36 +330,65 @@ def evaluate_other(
             inputs = {k: v.to(device) for k, v in inputs.items() if k == "pixel_values"}
             with torch.no_grad():
                 features = clip.get_image_features(**inputs)
-                features = _to_tensor(features)
-                logits = model(features)
-                probs = logits.softmax(dim=-1).squeeze(0)
+                features = _to_tensor(features).squeeze(0)  # [512]
+                features = F.normalize(features, p=2, dim=0)  # L2-normalise
 
-            best_idx = probs.argmax().item()
+                # Cosine distance = 1 - cosine_similarity
+                cos_sim = features @ centroids.T              # [C]
+                cos_dist = 1.0 - cos_sim                      # [C]
+                min_dist, best_idx = cos_dist.min(dim=0)
+
             results.append({
                 "path": str(img_path),
-                "predicted": TRAIN_CLASSES[best_idx],
-                "confidence": round(probs[best_idx].item(), 4),
-                "scores": {TRAIN_CLASSES[i]: round(probs[i].item(), 4) for i in range(len(TRAIN_CLASSES))},
+                "nearest_class": label_names[best_idx.item()],
+                "min_cosine_dist": round(min_dist.item(), 4),
+                "all_distances": {
+                    label_names[i]: round(cos_dist[i].item(), 4)
+                    for i in range(len(label_names))
+                },
             })
         except Exception:
             logger.exception("Failed to process %s", img_path)
 
-    # Summary
-    above_threshold = sum(
-        1 for r in results if r["confidence"] >= settings.confidence_threshold
-    )
-    print("\n" + "=" * 60)
-    print(f"Other-Class Evaluation ({len(results)} images)")
-    print("=" * 60)
-    print(f"  Threshold: {settings.confidence_threshold}")
-    print(f"  Above threshold (would be misclassified): {above_threshold}/{len(results)}")
-    print(f"  Below threshold (correctly → other):   {len(results) - above_threshold}/{len(results)}")
+    # --- Distribution summary ---
+    distances = sorted([r["min_cosine_dist"] for r in results])
+    n = len(distances)
+    if n == 0:
+        return results
 
-    if results:
-        print("\n  Per-image predictions:")
-        for r in results:
-            flag = "MISCLASSIFIED" if r["confidence"] >= settings.confidence_threshold else "ok"
-            print(f"  [{flag}] {Path(r['path']).name}: → {r['predicted']} ({r['confidence']:.3f})")
+    def _percentile(sorted_vals: list[float], p: float) -> float:
+        """Linear-interpolation percentile (like numpy)."""
+        n = len(sorted_vals)
+        if n == 1:
+            return sorted_vals[0]
+        k = (p / 100) * (n - 1)
+        f = int(k)
+        c = k - f
+        if f + 1 >= n:
+            return sorted_vals[-1]
+        return sorted_vals[f] + c * (sorted_vals[f + 1] - sorted_vals[f])
+
+    pcts = [0, 25, 50, 75, 85, 90, 95, 100]
+    pct_values = {p: _percentile(distances, p) for p in pcts}
+
+    print("\n" + "=" * 60)
+    print(f"Other-Class Evaluation ({n} images) — Cosine Distance to Nearest Centroid")
+    print("=" * 60)
+    print(f"  Distance range: [{distances[0]:.4f}, {distances[-1]:.4f}]")
+    print(f"  Percentiles:")
+    for p in pcts:
+        print(f"    {p:3d}th: {pct_values[p]:.4f}")
+    print()
+    print(f"  Suggested threshold: {pct_values[85]:.4f}  (85th percentile — catches ~85% of 'other')")
+    print(f"  If you pick {pct_values[75]:.4f} (75th), fewer 'other' images leak through")
+    print(f"  but more real charts may also be flagged as 'other'.")
+
+    # Show per-image details
+    print(f"\n  Per-image predictions:")
+    for r in results:
+        dist = r["min_cosine_dist"]
+        nearest = r["nearest_class"]
+        print(f"  [{dist:.4f}] {Path(r['path']).name}: nearest={nearest}")
 
     return results
 
@@ -371,15 +462,20 @@ def main() -> None:
         device=args.device,
     )
 
-    # --- Save ---
+    # --- Save probe + label map ---
     save_probe(probe, features["label_names"], args.output, args.label_map)
 
-    # --- Threshold calibration on "other" ---
-    evaluate_other(probe, features, device=args.device)
+    # --- Compute & save centroids (for outlier-based "other" detection) ---
+    centroids_data = compute_centroids(features, features["label_names"], args.device)
+    save_centroids(centroids_data, DEFAULT_CENTROIDS)
+
+    # --- Threshold calibration on "other" (cosine distance) ---
+    evaluate_other(centroids_data, device=args.device)
 
     print("\nDone. Next steps:")
     print("  1. Check the classification report above.")
-    print("  2. Adjust CONFIDENCE_THRESHOLD in .env based on 'other' evaluation.")
+    print("  2. Check the cosine-distance percentiles above and set")
+    print("     CENTROID_DISTANCE_THRESHOLD in .env (e.g. 0.30).")
     print("  3. Run: pytest tests/test_classifier.py tests/test_api.py -v")
     print("  4. Start service: uvicorn app.main:app --port 8011")
 

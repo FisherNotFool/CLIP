@@ -20,6 +20,7 @@ def classifier(mock_clip_model) -> ClipClassifier:
         offline=True,
         linear_probe_path=mock_clip_model["probe_path"],
         label_map_path=mock_clip_model["label_map_path"],
+        centroids_path=mock_clip_model["centroids_path"],
     )
 
 
@@ -46,6 +47,14 @@ class TestInitialization:
         # "other" is in config but not in trained labels
         assert trained.issubset(config_labels)
         assert "other" not in trained
+
+    def test_centroids_loaded(self, classifier):
+        assert classifier._centroids is not None
+        assert classifier._centroids.shape == (4, 512)
+        # Centroids should be L2-normalised
+        for c in range(4):
+            norm = classifier._centroids[c].norm(p=2).item()
+            assert abs(norm - 1.0) < 0.001
 
 
 class TestClassifySingle:
@@ -81,10 +90,15 @@ class TestClassifySingle:
         result = classifier.classify_single(sample_image_rgba)
         assert result.label in {"bar_chart", "line_chart", "sem", "xrd", "other"}
 
-    def test_threshold_forces_other(self, classifier, sample_image_rgb):
-        """With threshold=0.99 the best label should be forced to 'other'."""
-        result = classifier.classify_single(sample_image_rgb, confidence_threshold=0.99)
+    def test_centroid_distance_forces_other(self, classifier, sample_image_rgb):
+        """With distance_threshold=-0.5, every image is too far → 'other'."""
+        result = classifier.classify_single(sample_image_rgb, distance_threshold=-0.5)
         assert result.label == "other"
+
+    def test_centroid_distance_passes_known(self, classifier, sample_image_rgb):
+        """With distance_threshold=0.5, close matches pass through to probe."""
+        result = classifier.classify_single(sample_image_rgb, distance_threshold=0.5)
+        assert result.label != "other"  # colorful → bar_chart via mock
 
 
 class TestClassifyBatch:
