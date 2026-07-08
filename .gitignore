@@ -8,7 +8,7 @@ dist/
 venv/
 
 # Model cache — only project-specific weights; CLIP base model downloaded separately
-model_cache/
+model_cache/*
 !model_cache/linear_probe.pt
 !model_cache/label_map.json
 !model_cache/centroids.pt

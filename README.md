@@ -22,7 +22,14 @@
 
 ## 快速部署
 
-### 1. 安装依赖
+### 1. 获取代码
+
+```bash
+git clone <repo-url>
+cd CLIP
+```
+
+### 2. 安装依赖
 
 ```bash
 pip install -r requirements.txt
@@ -36,62 +43,71 @@ conda activate clip_env
 pip install -r requirements.txt
 ```
 
-### 2. 准备模型文件
+### 3. 下载 CLIP 基础模型（仅首次，需联网）
 
-确保 `model_cache/` 目录下有以下文件（由训练脚本生成）：
+仓库只包含本项目训练的轻量文件（分类头 + 中心点，共 ~20 KB）。
+CLIP 预训练权重（~600 MB）需要单独下载一次：
+
+```bash
+# 正常网络
+python scripts/download_model.py
+
+# 国内网络（使用镜像）
+python scripts/download_model.py --mirror https://hf-mirror.com
+```
+
+下载完成后 `model_cache/` 目录结构：
 
 ```
 model_cache/
-├── models--openai--clip-vit-base-patch32/   # CLIP 预训练权重（~1.7 GB）
-├── linear_probe.pt                          # 线性分类头（~1 MB）
-├── label_map.json                           # 标签映射
-└── centroids.pt                             # 类中心点（离群检测用）
+├── models--openai--clip-vit-base-patch32/   # CLIP 预训练权重（~600 MB）
+├── linear_probe.pt                          # 线性分类头（~10 KB，仓库已含）
+├── label_map.json                           # 标签映射（仓库已含）
+└── centroids.pt                             # 类中心点（~10 KB，仓库已含）
 ```
 
-如果是从开发环境迁移，直接拷贝整个 `model_cache/` 目录即可。
+### 4. 配置
 
-**离线部署注意**：`.env` 中设置 `TRANSFORMERS_OFFLINE=1`，服务不会访问外网。
+```bash
+cp .env.example .env
+```
 
-### 3. 配置
-
-编辑 `.env` 文件：
+按需编辑 `.env`：
 
 ```ini
-# 模型
-CLIP_MODEL_NAME=openai/clip-vit-base-patch32
-MODEL_CACHE_DIR=./model_cache
-DEVICE=cpu                          # 改为 cuda 使用 GPU
-TRANSFORMERS_OFFLINE=1              # 离线模式，只读本地缓存
+# 必须修改
+IMAGE_BASE_PATH=./outputs           # 上游系统传入图片的根目录
 
-# 服务
-HOST=0.0.0.0
-PORT=8011
-
-# 图片处理
-IMAGE_BASE_PATH=./outputs           # 上游图片存放的根目录
-CENTROID_DISTANCE_THRESHOLD=0.27    # other 判定阈值
-MAX_IMAGE_SIZE=1920                 # 超过此尺寸自动缩放
-BATCH_SIZE=8                        # 每批处理图片数
+# 可选调整
+DEVICE=cpu                          # 有 GPU 改为 cuda
+CENTROID_DISTANCE_THRESHOLD=0.27    # other 判定阈值（越小越严格）
+BATCH_SIZE=8                        # GPU 可调大，如 32
 ```
 
 | 配置项 | 说明 |
 |--------|------|
-| `IMAGE_BASE_PATH` | 图片根目录，API 中的 `image_paths` 相对于此路径 |
-| `CENTROID_DISTANCE_THRESHOLD` | other 判定灵敏度（0~2），越小越严格。当前 0.27 是最优平衡 |
+| `IMAGE_BASE_PATH` | **必改**。API 中 `image_paths` 相对于此路径拼接 |
+| `CENTROID_DISTANCE_THRESHOLD` | other 灵敏度（0~2），0.27 经验最优 |
 | `DEVICE` | `cpu` 或 `cuda` |
-| `BATCH_SIZE` | 根据 GPU 显存调整，CPU 用 8 即可 |
+| `TRANSFORMERS_OFFLINE` | 默认 `1`（离线），下载模型时临时改为 `0` |
+| `BATCH_SIZE` | GPU 显存充足可调大，CPU 用 8 |
 
-### 4. 启动
+### 5. 启动
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8011
 ```
 
-启动后访问 `http://localhost:8011/api/clip/health` 确认状态：
+健康检查：
 
-```json
-{"status": "ok", "model_loaded": true}
+```bash
+curl http://localhost:8011/api/clip/health
+# → {"status": "ok", "model_loaded": true}
 ```
+
+### 离线部署
+
+在能联网的机器上完成步骤 1-3，然后将整个项目目录（含 `model_cache/`）拷贝到离线服务器。`.env` 中 `TRANSFORMERS_OFFLINE=1` 确保服务不访问外网。
 
 ---
 
@@ -231,8 +247,8 @@ CLIP/
 ├── scripts/
 │   ├── train.py             # 训练脚本
 │   └── download_model.py    # 模型下载（仅首次）
-├── model_cache/             # 模型权重 + 分类头 + 中心点
-├── .env                     # 配置文件
+├── model_cache/             # 模型权重（需下载）+ 分类头 + 中心点
+├── .env.example             # 配置模板
 ├── requirements.txt
 └── README.md
 ```
