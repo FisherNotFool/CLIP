@@ -8,7 +8,6 @@ dist/
 venv/
 
 # Model cache (large binary files — use download_model.py to populate)
-model_cache/
 
 # Environment (may contain local paths)
 .env
