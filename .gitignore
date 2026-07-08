@@ -7,7 +7,11 @@ dist/
 .venv/
 venv/
 
-# Model cache (large binary files — use download_model.py to populate)
+# Model cache — only project-specific weights; CLIP base model downloaded separately
+model_cache/
+!model_cache/linear_probe.pt
+!model_cache/label_map.json
+!model_cache/centroids.pt
 
 # Environment (may contain local paths)
 .env
