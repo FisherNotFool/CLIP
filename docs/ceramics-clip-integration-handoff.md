@@ -59,7 +59,7 @@ model_cache/other_gate.pt
 
 `../outputs` 的相对路径以 `backend/model_services/` 为工作目录，对应 `backend/outputs`。容器只读挂载，这是强制约束。
 
-首次构建需要网络访问 Hugging Face；构建完成后模型基座权重已在镜像中，运行时使用离线模式。
+Docker 构建不访问 Hugging Face，而是直接复制 `model_cache/` 中已准备好的 CLIP 基座缓存。基座权重不纳入 Git；首次部署前需将现有 CLIP 工作目录的 `model_cache/models--openai--clip-vit-base-patch32/` 一并带入 submodule 工作树（或在可联网的宿主机先启动一次 CLIP API 生成该缓存）。容器运行时始终使用离线模式。
 
 启动与检查：
 
