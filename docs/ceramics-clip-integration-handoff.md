@@ -30,14 +30,13 @@ model_cache/other_gate.pt
 
 ## Docker Compose 接入
 
+生产部署应引用已发布的版本化镜像，不能在 Ceramics 主机上使用 `build:`。镜像发布和拉取步骤见 [container-release.md](container-release.md)。
+
 在 `backend/model_services/docker-compose.yml` 的 `services:` 下增加：
 
 ```yaml
   clip-model:
-    build:
-      context: ./clip-service
-      dockerfile: Dockerfile
-    image: ceramics-clip:latest
+    image: ${CLIP_IMAGE}
     container_name: ceramics_clip_model
     restart: unless-stopped
     environment:

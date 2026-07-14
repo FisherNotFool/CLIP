@@ -1,0 +1,29 @@
+# Deployment-only Compose file. It intentionally has no `build:` section:
+# consumers pull a versioned image that already contains the CLIP base cache.
+services:
+  clip-model:
+    image: ${CLIP_IMAGE:?Set CLIP_IMAGE to a published, versioned CLIP image}
+    container_name: ceramics_clip_model
+    restart: unless-stopped
+    environment:
+      DEVICE: ${CLIP_DEVICE:-cpu}
+      IMAGE_BASE_PATH: /data/outputs
+      MAX_IMAGE_SIZE: ${CLIP_MAX_IMAGE_SIZE:-1920}
+      BATCH_SIZE: ${CLIP_BATCH_SIZE:-8}
+    ports:
+      - "${CLIP_PORT:-8011}:8011"
+    volumes:
+      - type: bind
+        source: ${IMAGE_OUTPUTS_PATH:?Set IMAGE_OUTPUTS_PATH to Ceramics backend/outputs}
+        target: /data/outputs
+        read_only: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/api/clip/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
