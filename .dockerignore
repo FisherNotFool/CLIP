@@ -1,0 +1,14 @@
+.git/
+.agents/
+.codex/
+.vscode/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.env
+samples/
+scripts/
+tests/
+outputs/
+docs/
+一键启动.bat
