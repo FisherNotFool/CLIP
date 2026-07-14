@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import Counter
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -52,21 +54,44 @@ async def classify_images(
     Returns ``image_type`` and ``confidence`` for each image.
     Pass ``?debug=true`` to receive the full softmax distribution per image.
     """
+    started_at = time.perf_counter()
+    image_inputs = body.image_inputs
+    logger.info(
+        "classify request document_id=%s images=%d captions=%d detector=%s debug=%s",
+        body.document_id, len(image_inputs),
+        sum(image.caption is not None for image in image_inputs),
+        "gate", debug,
+    )
+
     # Resolve paths against the configured image base directory
     resolved_paths: list[Path] = []
-    for p in body.image_paths:
+    for image in image_inputs:
         # Normalise: strip leading slash so join works correctly
-        clean = p.lstrip("/").lstrip("\\")
+        clean = image.image_path.lstrip("/").lstrip("\\")
         resolved_paths.append(settings.image_base_path / clean)
 
     # Delegate to the classifier service
     try:
         results: list[ClassificationResult] = classifier.classify_batch(
             resolved_paths,
-            distance_threshold=settings.centroid_distance_threshold,
+            captions=[image.caption for image in image_inputs],
         )
     except Exception as exc:
+        logger.exception("classify failed document_id=%s images=%d", body.document_id, len(image_inputs))
         raise InferenceError(str(exc)) from exc
+
+    labels = Counter(result.label for result in results)
+    errors = sum(result.label == "error" for result in results)
+    logger.info(
+        "classify completed document_id=%s elapsed_ms=%.1f labels=%s errors=%d",
+        body.document_id, (time.perf_counter() - started_at) * 1000,
+        dict(sorted(labels.items())), errors,
+    )
+    for result in results:
+        logger.debug(
+            "classify result document_id=%s path=%s label=%s confidence=%.4f",
+            body.document_id, result.image_path, result.label, result.confidence,
+        )
 
     # Map internal results → Pydantic response models
     classifications: list[ImageClassification] = []

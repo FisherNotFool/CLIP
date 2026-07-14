@@ -1,187 +1,166 @@
 # CLIP 图像分类模块优化记录
 
-## 背景
+## 当前目标
 
-为 Ceramics（陶瓷材料科学论文处理）平台构建图像分类模块，将学术 PDF 中提取的图片分为 5 类：
+为 Ceramics 文献解析链路中的图片提供类型标签，并优先拦截不属于目标类型的 `other` 图片。
 
-| 类别 | 说明 |
-|------|------|
-| bar_chart | 柱状图 |
-| line_chart | 折线图 |
-| sem | SEM 显微图 |
-| xrd | XRD 衍射图谱 |
-| other | 其他（照片、示意图等） |
+当前已知类别为：
 
-部署环境：离线（本地），开发用 CPU，生产有 GPU。
+| 标签 | 含义 |
+|---|---|
+| `bar_chart` | 柱状图 |
+| `line_chart` | 折线图 / 曲线图 |
+| `sem` | SEM 扫描电子显微图 |
+| `tem` | TEM 透射电子显微图 |
+| `xrd` | XRD 衍射图谱 |
+| `other` | 其他图片，如示意图、装置图、照片、表格等 |
 
----
-
-## Phase 1: 零样本 CLIP（失败）
-
-### 方案
-
-使用 `openai/clip-vit-base-patch32`，为每类编写自然语言 prompt，通过图像特征与文本特征的余弦相似度进行分类。
-
-### 结果
-
-多轮 prompt 调优后准确率稳定在 **~50%**。
-
-### 失败原因
-
-- **XRD vs line_chart 无法区分**：两者视觉特征在 CLIP 空间中高度重叠（都是线条 + 坐标轴），自然语言 prompt 无法捕捉 X 轴标注 "2θ" 这类细粒度差异
-- **"other" 类别无统一特征**：照片、示意图、表格等外观差异极大，无法用有限 prompt 覆盖
-
-### 尝试的 prompt 优化
-
-- 为 XRD 强调"横坐标 2θ、纵坐标 Intensity、尖锐衍射峰" → 仍被分类为 line_chart
-- 移除 other 的 prompt，改为"四类都低置信度时兜底" → 无改善
-- 多轮 prompt 精调后准确率反而下降到 48%
-
-结论：**零样本 CLIP 不适合同类图表区分任务。**
+`other` 不参与五分类主分类器，而是由独立 gate 拦截。
 
 ---
 
-## Phase 2: Linear Probe 微调（成功）
+## 当前架构
 
-### 方案
-
-冻结 CLIP 视觉编码器，在 512 维特征之上训练一个 `nn.Linear(512, 4)` 分类头。
-
-**核心设计**：
-- 只训练 4 类（bar_chart / line_chart / sem / xrd）
-- "other" **不参与训练**（无统一特征，强训只会过拟合到训练集中的具体样本）
-- "other" 通过置信度阈值兜底：softmax 最高分 < 阈值 → other
-
-### 训练流程
-
-```
-samples/{class}/ 下所有图片
-  → 冻结的 CLIP ViT 提取 512 维特征
-  → 缓存到 scripts/features.pt
-  → 分层 80/20 划分
-  → 训练 nn.Linear(512, 4) + CrossEntropyLoss(weight=class_weights) + Adam
-  → 保存 model_cache/linear_probe.pt + model_cache/label_map.json
+```text
+图片
+  → CLIP ViT 图像编码器（冻结）
+  → known / other 二分类 gate
+      ├─ other → 返回 other
+      └─ known → 五分类 Linear Probe
+                    → bar_chart / line_chart / sem / tem / xrd
 ```
 
-### 结果
-
-| 指标 | 零样本 | Linear Probe |
-|------|--------|-------------|
-| 准确率 | ~50% | **93.1%** |
-| 训练时间 | — | < 1 分钟 (CPU) |
-
-### 遗留问题
-
-Softmax 阈值兜底基本无效——104 张 other 图只有 7 张（6.7%）被拦截。原因是 softmax 强制 4 类概率之和为 1，对不相关的图也必须"选一个最像的"，置信度常高达 0.90+。
-
-```
-softmax([0.3, 4.8, -1.5, 0.8]) → line_chart 0.95
-                                    ↑ 看似很确定，但其实什么都不是
-```
+接口可携带 caption。当视觉五分类置信度低于 0.75 时，caption 规则可对明确、单一类别信号做保守纠偏；gate 已拦截为 `other` 的结果不会被 caption 推翻。
 
 ---
 
-## Phase 3: Centroid 距离检测（当前方案）
+## 数据集与人工审查
 
-### 方案
+待审查图片按“文献目录 / 图片”的结构保存。预标注脚本生成 `review_manifest.csv`，人工审查规则为：
 
-把 "other" 的判断从分类问题改为**离群检测**：
-
-```
-训练: 计算每个类的 CLIP 特征中心点 (centroid, 512 维 L2 归一化向量)
-
-推理: 图像 → CLIP 特征 → 余弦距离到 4 个中心
-      → 最短距离 > 阈值 → "other"（离所有已知类都太远）
-      → 最短距离 ≤ 阈值 → Linear Probe 分类（判断属于哪个类）
+```text
+review_label 为空  → 接受 predicted_label
+review_label 非空  → 使用 review_label 作为最终标签
 ```
 
-**关键**："是不是已知类"和"是哪个已知类"是两个独立判断，互不污染。
+导入脚本将图片组织为：
 
-### 距离分布
-
-samples/other/ 下 104 张图片到最近类中心的余弦距离：
-
+```text
+samples/
+├── sem/reviewed/<document_id>/...
+├── tem/reviewed/<document_id>/...
+├── xrd/reviewed/<document_id>/...
+└── other/reviewed/<document_id>/...
 ```
-范围: [0.095, 0.479]
-25th: 0.172    50th: 0.229    75th: 0.270    85th: 0.313    95th: 0.355
-```
 
-### 阈值选择
+该结构保留文献归属，供后续按文献分组评估使用。
 
-| 阈值 | Other 拦截率 | 训练类准确率 | 误杀（false positive） |
-|------|-------------|-------------|----------------------|
-| 0.17 | 76.9% | 89.3% | 25 张 (4.6%) |
-| **0.27** | **25.0%** | **93.1%** | **2 张 (0.4%)** |
-| 0.31 | 17.3% | 93.3% | 1 张 (0.2%) |
+本轮已审查并导入 2517 张图片；五个已知类的训练图片数量为：
 
-**选定 0.27** — 在不牺牲训练类准确率的前提下，最大化 other 拦截。
+| 类别 | 数量 |
+|---|---:|
+| bar_chart | 121 |
+| line_chart | 711 |
+| sem | 315 |
+| tem | 80 |
+| xrd | 186 |
+| other | 1129 |
 
-### 局限性
-
-Other 拦截率上限受 CLIP 视觉编码器本身约束。部分 other 图（材料照片等）在 CLIP 的 512 维空间中与图表类的距离最近仅 0.095，与类内距离无法区分。这不是分类器设计问题，而是 CLIP 对"图表 vs 非图表"的底层判别力有限。
+新增的 `samples/tem/reviewed/new_tem` 图片会被训练脚本递归读取，支持 JPG、JPEG、PNG、BMP、TIFF、WEBP。
 
 ---
 
-## 最终架构
+## 当前训练结果（图片级分层留出集）
 
+### 五分类 Linear Probe
+
+| 指标 | 结果 |
+|---|---:|
+| Accuracy | 92.6% |
+| Macro-F1 | 0.89 |
+| bar_chart F1 | 0.84 |
+| line_chart F1 | 0.96 |
+| SEM F1 | 0.93 |
+| TEM F1 | 0.80 |
+| XRD F1 | 0.90 |
+
+TEM 样本从 55 张增至 80 张后，TEM recall 提升到 0.88；仍建议持续补充易与 SEM 混淆的 TEM 样本。
+
+### Other gate
+
+| 指标 | 结果 |
+|---|---:|
+| other recall | 95.6% |
+| known false rejection | 1.8% |
+| 保存阈值 | 0.4701 |
+
+以上 gate 指标来自训练脚本的留出验证。
+
+---
+
+## 启用 gate
+
+训练生成以下产物：
+
+```text
+model_cache/linear_probe.pt
+model_cache/label_map.json
+model_cache/other_gate.pt
 ```
-图像 → CLIP ViT (冻结)
-         │
-         ├─→ L2 归一化 → 余弦距离到 4 个类中心
-         │                    │
-         │               min_dist > 0.27 → "other"
-         │               min_dist ≤ 0.27 ↓
-         │
-         └─→ nn.Linear(512, 4) → softmax → bar_chart / line_chart / sem / xrd
+
+gate 是唯一的 other 拦截器，`.env` 只需保留产物路径：
+
+```ini
+OTHER_GATE_PATH=./model_cache/other_gate.pt
 ```
 
 ---
 
-## 文件结构
+## Caption 规则
 
-```
-CLIP/
-├── app/
-│   ├── services/classifier.py    # ClipClassifier（推理核心）
-│   ├── config.py                 # 配置（阈值、路径）
-│   ├── lifespan.py               # FastAPI 生命周期
-│   └── api/router.py             # POST /api/clip/classify
-├── scripts/
-│   └── train.py                  # 训练脚本（特征提取 + 训练 + centroids）
-├── model_cache/
-│   ├── linear_probe.pt           # 训练的线性分类头
-│   ├── label_map.json            # 标签映射
-│   ├── centroids.pt              # 类中心点（离群检测）
-│   └── models--openai--...       # CLIP 模型缓存
-├── samples/                      # 训练/评估样本
-│   ├── bar_chart/  line_chart/  sem/  xrd/
-│   └── other/                    # 仅用于阈值标定
-├── tests/
-│   ├── test_classifier.py        # 单元测试（mock 模型）
-│   ├── test_api.py               # API 测试
-│   └── test_integration.py       # 集成测试（真实模型）
-└── .env                          # CENTROID_DISTANCE_THRESHOLD=0.27
-```
+规则只在视觉置信度 `< 0.75` 时使用，且 caption 只能命中一个类别；复合图或同时命中多个类别时不覆盖视觉结果。
+
+| 类别 | 强信号示例 |
+|---|---|
+| TEM | `TEM`、`HRTEM`、`HAADF`、`STEM`、`SAED`、`transmission electron microscopy` |
+| SEM | `SEM`、`scanning electron microscopy` |
+| XRD | `XRD`、`x-ray diffraction`、`2θ` |
+| bar_chart | `bar chart`、`bar graph`、`histogram` |
+| line_chart | `line chart`、`line plot`、`line graph`、`curve` |
 
 ---
 
-## 命令速查
+## API 请求
 
-```bash
-# 训练
-python scripts/train.py
+当前推荐请求体：
 
-# 单元测试
-pytest tests/test_classifier.py tests/test_api.py -v
-
-# 集成测试（含阈值效果评估）
-pytest tests/test_integration.py -m integration -v -s
-
-# 启动服务
-uvicorn app.main:app --port 8011
-
-# API 调用
-curl -X POST http://localhost:8011/api/clip/classify \
-  -H "Content-Type: application/json" \
-  -d '{"document_id": "test", "image_paths": ["/path/to/image.jpg"]}'
+```json
+{
+  "document_id": "paper_001",
+  "images": [
+    {
+      "image_path": "/doc_001/fig1.jpg",
+      "caption": "Figure 1. SEM morphology of the sample."
+    },
+    {
+      "image_path": "/doc_001/fig2.jpg",
+      "caption": "Figure 2. XRD patterns."
+    }
+  ]
+}
 ```
+
+旧的 `image_paths` 请求字段仍暂时兼容，便于上游渐进迁移。
+
+---
+
+## 已知限制与下一步
+
+当前训练/测试是按图片随机分层切分。同一篇文献中的相似图片可能进入训练与测试两侧，指标可能偏乐观。
+
+下一步应使用 `reviewed/<document_id>` 目录做按文献分组的训练、标定和测试切分，并重新评估：
+
+- 五分类 Macro-F1 是否达到 0.90；
+- TEM 与 SEM 的混淆；
+- gate 的 other recall 与已知类误拒；
+- caption 规则在真实低置信度样本上的净增益。
