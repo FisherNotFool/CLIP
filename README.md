@@ -2,7 +2,33 @@
 
 面向材料论文图片的分类 API。服务返回 `bar_chart`、`line_chart`、`sem`、`tem`、`xrd` 或 `other`，并使用 gate 拦截非目标图片。
 
-## Docker 快速部署
+## 在 Ceramics 中部署（推荐）
+
+**不需要**在 `model_services` 中执行 `git clone CLIP`。生产环境直接拉取已经发布的镜像即可。
+
+首次接入时，由 Ceramics 后端维护者按[交接文档](docs/ceramics-clip-integration-handoff.md)在下面的文件中加入 `clip-model` 服务定义：
+
+```text
+D:\Project\ceramics\material-kg\backend\model_services\docker-compose.yml
+```
+
+完成该一次性配置后，实际部署只需在 Ceramics 的模型服务目录执行：
+
+```powershell
+cd D:\Project\ceramics\material-kg\backend\model_services
+
+# 仅当 GHCR 镜像为私有时需要登录
+docker login ghcr.io -u FisherNotFool
+
+$env:CLIP_IMAGE = "ghcr.io/fishernotfool/ceramics-clip:0.2.0"
+docker compose pull clip-model
+docker compose up -d clip-model
+Invoke-RestMethod http://127.0.0.1:8011/api/clip/health
+```
+
+`backend/model_services/docker-compose.yml` 中的 CLIP 服务应将 `../outputs` 只读挂载为 `/data/outputs`。由于 Compose 文件位于 `backend/model_services`，该路径正好对应 `backend/outputs`。
+
+## 独立 Docker 部署
 
 部署者只需 Docker，不需要 conda、PyTorch、Hugging Face 网络或本地模型文件。镜像已包含 CLIP 基座模型和训练得到的分类器、gate。
 
